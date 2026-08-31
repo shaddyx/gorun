@@ -49,6 +49,51 @@ require_git() {
     fi
 }
 
+# Idempotently ensure $gobin is on PATH by writing an export line to the
+# user's shell rc file(s). Safe to run repeatedly: it never duplicates lines.
+ensure_path() {
+    local gobin="$1"
+    local line="export PATH=\"\$PATH:$gobin\""
+
+    # Candidate rc files, most specific shell first, deduped, existing only.
+    local files=()
+    local f
+    for f in \
+        "${ZDOTDIR:-$HOME}/.zshrc" \
+        "$HOME/.bashrc" \
+        "$HOME/.bash_profile" \
+        "$HOME/.profile"; do
+        [[ -f "$f" ]] || continue
+        local seen=0
+        local p
+        for p in "${files[@]}"; do
+            [[ "$p" == "$f" ]] && seen=1
+        done
+        (( seen )) || files+=("$f")
+    done
+
+    if (( ${#files[@]} == 0 )); then
+        warn "no shell rc file found; add it manually with:  $line"
+        return 0
+    fi
+
+    local rc
+    for rc in "${files[@]}"; do
+        # Idempotent: skip if the exact line (or a matching PATH entry) exists.
+        if grep -qF "$line" "$rc" 2>/dev/null; then
+            log "$rc already has $gobin on PATH"
+            continue
+        fi
+        if grep -qE "PATH=.*(^|:)$gobin(:|$)" "$rc" 2>/dev/null; then
+            log "$rc already has $gobin on PATH"
+            continue
+        fi
+
+        printf '\n# added by gorun installer\n%s\n' "$line" >>"$rc"
+        log "added $gobin to PATH in $rc"
+    done
+}
+
 main() {
     require_go
     require_git
@@ -69,7 +114,8 @@ main() {
 
     if ! command -v gorun >/dev/null 2>&1; then
         warn "$gobin is not on your PATH"
-        warn "add it with:  export PATH=\"\$PATH:$gobin\""
+        ensure_path "$gobin"
+        warn "restart your shell or run:  source ~/.bashrc"
     fi
 
     log "done. run 'gorun --help' to get started"
