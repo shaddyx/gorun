@@ -78,10 +78,10 @@ func main() {
 
 func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool) error {
 	key := cacheKey(url)
-	dir := filepath.Join(cacheRoot, key)
+	name := repoName(url)
+	dir := filepath.Join(cacheRoot, name+"-"+key)
 	srcDir := filepath.Join(dir, "src")
 	binDir := filepath.Join(dir, "bin")
-	name := repoName(url)
 	binPath := filepath.Join(binDir, name)
 
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
