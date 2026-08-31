@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -153,17 +154,25 @@ func upgradeAllCached(cacheRoot string) error {
 func gitClone(url, srcDir string) error {
 	fmt.Printf("cloning %s\n", url)
 	cmd := exec.Command("git", "clone", "--depth", "1", url, srcDir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runQuiet(cmd)
 }
 
 func gitPull(srcDir string) error {
 	fmt.Printf("pulling %s\n", srcDir)
 	cmd := exec.Command("git", "-C", srcDir, "pull", "--ff-only")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runQuiet(cmd)
+}
+
+// runQuiet runs cmd with output captured, only printing it if the command fails.
+func runQuiet(cmd *exec.Cmd) error {
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Run(); err != nil {
+		fmt.Fprint(os.Stderr, buf.String())
+		return err
+	}
+	return nil
 }
 
 func goBuild(srcDir, binPath string) error {
