@@ -24,6 +24,7 @@ Flags:
   --upgrade      force re-fetch (git pull) and rebuild, then run
   --upgrade-all  re-query git and rebuild every cached project, then exit
   --clean        wipe the entire gorun cache, then exit
+  --verbose      show the full process output without suppression
 
 The first positional argument is the git URL; everything after it is
 forwarded verbatim to the application.
@@ -33,6 +34,7 @@ func main() {
 	upgrade := flag.Bool("upgrade", false, "force re-fetch and rebuild, then run")
 	upgradeAll := flag.Bool("upgrade-all", false, "re-query git and rebuild every cached project")
 	clean := flag.Bool("clean", false, "wipe the entire gorun cache")
+	verbose := flag.Bool("verbose", false, "show the full process output without suppression")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
 
@@ -54,7 +56,7 @@ func main() {
 	}
 
 	if *upgradeAll {
-		if err := upgradeAllCached(cacheRoot); err != nil {
+		if err := upgradeAllCached(cacheRoot, *verbose); err != nil {
 			fatal("%v", err)
 		}
 		return
@@ -69,12 +71,12 @@ func main() {
 	url := args[0]
 	appArgs := args[1:]
 
-	if err := run(cacheRoot, url, appArgs, *upgrade); err != nil {
+	if err := run(cacheRoot, url, appArgs, *upgrade, *verbose); err != nil {
 		fatal("%v", err)
 	}
 }
 
-func run(cacheRoot, url string, appArgs []string, upgrade bool) error {
+func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool) error {
 	key := cacheKey(url)
 	dir := filepath.Join(cacheRoot, key)
 	srcDir := filepath.Join(dir, "src")
@@ -87,11 +89,11 @@ func run(cacheRoot, url string, appArgs []string, upgrade bool) error {
 	}
 
 	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
-		if err := gitClone(url, srcDir); err != nil {
+		if err := gitClone(url, srcDir, verbose); err != nil {
 			return err
 		}
 	} else if upgrade {
-		if err := gitPull(srcDir); err != nil {
+		if err := gitPull(srcDir, verbose); err != nil {
 			return err
 		}
 	}
@@ -112,7 +114,7 @@ func run(cacheRoot, url string, appArgs []string, upgrade bool) error {
 	return execApp(binPath, appArgs)
 }
 
-func upgradeAllCached(cacheRoot string) error {
+func upgradeAllCached(cacheRoot string, verbose bool) error {
 	entries, err := os.ReadDir(cacheRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -141,7 +143,7 @@ func upgradeAllCached(cacheRoot string) error {
 		binPath := filepath.Join(binDir, name)
 
 		fmt.Printf("upgrading %s\n", e.Name())
-		if err := gitPull(srcDir); err != nil {
+		if err := gitPull(srcDir, verbose); err != nil {
 			return err
 		}
 		if err := goBuild(srcDir, binPath); err != nil {
@@ -151,15 +153,26 @@ func upgradeAllCached(cacheRoot string) error {
 	return nil
 }
 
-func gitClone(url, srcDir string) error {
+func gitClone(url, srcDir string, verbose bool) error {
 	fmt.Printf("cloning %s\n", url)
 	cmd := exec.Command("git", "clone", "--depth", "1", url, srcDir)
-	return runQuiet(cmd)
+	return runGit(cmd, verbose)
 }
 
-func gitPull(srcDir string) error {
+func gitPull(srcDir string, verbose bool) error {
 	fmt.Printf("pulling %s\n", srcDir)
 	cmd := exec.Command("git", "-C", srcDir, "pull", "--ff-only")
+	return runGit(cmd, verbose)
+}
+
+// runGit runs cmd, streaming output when verbose, otherwise capturing it and
+// only printing it if the command fails.
+func runGit(cmd *exec.Cmd, verbose bool) error {
+	if verbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
 	return runQuiet(cmd)
 }
 
