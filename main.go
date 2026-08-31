@@ -14,15 +14,15 @@ import (
 	"syscall"
 )
 
-const usage = `gox - run a Go application from a git URL
+const usage = `gorun - run a Go application from a git URL
 
 Usage:
-  gox [flags] <git-url> [app-args...]
+  gorun [flags] <git-url> [app-args...]
 
 Flags:
   --upgrade      force re-fetch (git pull) and rebuild, then run
   --upgrade-all  re-query git and rebuild every cached project, then exit
-  --clean        wipe the entire gox cache, then exit
+  --clean        wipe the entire gorun cache, then exit
 
 The first positional argument is the git URL; everything after it is
 forwarded verbatim to the application.
@@ -31,7 +31,7 @@ forwarded verbatim to the application.
 func main() {
 	upgrade := flag.Bool("upgrade", false, "force re-fetch and rebuild, then run")
 	upgradeAll := flag.Bool("upgrade-all", false, "re-query git and rebuild every cached project")
-	clean := flag.Bool("clean", false, "wipe the entire gox cache")
+	clean := flag.Bool("clean", false, "wipe the entire gorun cache")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
 
@@ -205,13 +205,13 @@ func execApp(binPath string, appArgs []string) error {
 
 func cacheRoot() (string, error) {
 	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
-		return filepath.Join(xdg, "gox"), nil
+		return filepath.Join(xdg, "gorun"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".cache", "gox"), nil
+	return filepath.Join(home, ".cache", "gorun"), nil
 }
 
 func cacheKey(url string) string {
@@ -241,6 +241,6 @@ func repoNameFromDir(srcDir string) string {
 }
 
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "gox: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "gorun: "+format+"\n", args...)
 	os.Exit(1)
 }
