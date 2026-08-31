@@ -41,6 +41,9 @@ gorun --upgrade-all
 
 # Wipe the entire cache
 gorun --clean
+
+# Show the full process output (git clone/pull) without suppression
+gorun --verbose https://github.com/rakyll/hey
 ```
 
 The first positional argument is the git URL; everything after it is forwarded
@@ -53,8 +56,12 @@ verbatim to the application.
 | `--upgrade`     | Force re-fetch (`git pull`) and rebuild, then run.                 |
 | `--upgrade-all` | Re-query git and rebuild every cached project, then exit.         |
 | `--clean`       | Wipe the entire gorun cache, then exit.                           |
+| `--verbose`     | Show the full process output (git clone/pull) without suppression. |
 
 `--clean` and `--upgrade-all` are mutually exclusive.
+
+By default git output is suppressed and only shown if the git command fails.
+Pass `--verbose` to stream it live.
 
 ## How it works
 
