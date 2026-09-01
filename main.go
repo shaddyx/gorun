@@ -161,7 +161,11 @@ func gitClone(url, srcDir string, verbose bool) error {
 
 func gitPull(srcDir string, verbose bool) error {
 	fmt.Printf("pulling %s\n", srcDir)
-	cmd := exec.Command("git", "-C", srcDir, "pull", "--ff-only")
+	cmd := exec.Command("git", "-C", srcDir, "fetch", "--all", "--prune")
+	if err := runGit(cmd, verbose); err != nil {
+		return err
+	}
+	cmd = exec.Command("git", "-C", srcDir, "reset", "--hard", "origin/HEAD")
 	return runGit(cmd, verbose)
 }
 
