@@ -44,10 +44,38 @@ gorun --clean
 
 # Show the full process output (git clone/pull) without suppression
 gorun --verbose https://github.com/rakyll/hey
+
+# Pin a version with an @ref suffix (tag, branch, or commit SHA)
+gorun github.com/user/repo@v1.0.2
+
+# Track a specific branch
+gorun github.com/user/repo@main
+
+# Highest semver release (or the default branch if untagged);
+# re-resolved only on --upgrade
+gorun github.com/user/repo@latest
 ```
 
 The first positional argument is the git URL; everything after it is forwarded
 verbatim to the application.
+
+A trailing `@ref` (tag, branch, or commit SHA) pins the checkout: the repo is
+cloned with `git clone --depth 1 --branch <ref>`, and `--upgrade` re-fetches and
+resets back to that ref instead of `origin/HEAD`. Each distinct `@ref` gets its
+own cache entry, so different versions can coexist.
+
+`@latest` is special: it resolves to the highest semver release tag
+(`v1.2.3`-style) in the remote, preferring releases over pre-releases. If the
+remote has no semver tags, it falls back to the most recent commit on the
+default branch. It maps to a single stable cache entry: the ref is resolved on
+the first run and re-resolved only on `--upgrade` (or `--upgrade-all`), so a
+plain re-run executes the cached binary with no network access. To track the
+newest commit on a specific branch regardless of tags, use the branch name
+instead (e.g. `@main` or `@master`).
+
+Schemeless URLs (`github.com/user/repo`) are normalized to `https://` before
+cloning, so both `github.com/user/repo@v1.0.2` and
+`https://github.com/user/repo@v1.0.2` resolve to the same cache entry.
 
 ## Flags
 
@@ -65,9 +93,14 @@ Pass `--verbose` to stream it live.
 
 ## How it works
 
-1. The git URL is hashed (SHA-256) to form a cache key.
+1. The git URL is hashed (SHA-256) to form a cache key. A trailing `@ref`
+   (version/branch/commit) is included in the key, so each version is cached
+   separately. `@latest` always maps to a single stable cache entry (keyed on
+   the literal `@latest`); it is resolved on the first run and re-resolved only
+   on `--upgrade`.
 2. The project is cloned into `$XDG_CACHE_HOME/gorun/<key>/src`
-   (default `~/.cache/gorun/<key>/src`).
+   (default `~/.cache/gorun/<key>/src`); if an `@ref` is present the clone is
+   pinned to it via `git clone --depth 1 --branch <ref>`.
 3. The binary is built into `<key>/bin/<name>`.
 4. On subsequent runs the cached binary is reused — no clone or build.
 5. `--upgrade` re-pulls and rebuilds; `--upgrade-all` does this for every cached
