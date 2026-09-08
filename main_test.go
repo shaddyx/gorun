@@ -6,6 +6,312 @@ import (
 	"testing"
 )
 
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func TestNormalizePkgPath(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "dot slash", in: "./cmd/x", want: "cmd/x"},
+		{name: "leading slash", in: "/cmd/x", want: "cmd/x"},
+		{name: "trailing slash", in: "cmd/x/", want: "cmd/x"},
+		{name: "both slashes", in: "/cmd/x/", want: "cmd/x"},
+		{name: "plain", in: "cmd/x", want: "cmd/x"},
+		{name: "empty", in: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizePkgPath(tt.in); got != tt.want {
+				t.Errorf("normalizePkgPath(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsMainPackageFile(t *testing.T) {
+	dir := t.TempDir()
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "package main", content: "package main\n\nfunc main() {}\n", want: true},
+		{name: "package other", content: "package foo\n\nfunc x() {}\n", want: false},
+		{name: "build tag then main", content: "//go:build linux\n\npackage main\n", want: true},
+		{name: "comment then main", content: "// comment\n\npackage main\n", want: true},
+		{name: "indented main", content: "   package main\n", want: true},
+		{name: "empty", content: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := filepath.Join(dir, tt.name+".go")
+			writeTestFile(t, p, tt.content)
+			if got := isMainPackageFile(p); got != tt.want {
+				t.Errorf("isMainPackageFile(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsMainPackageDir(t *testing.T) {
+	t.Run("with main file", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, "main.go"), "package main\n")
+		if !isMainPackageDir(dir) {
+			t.Error("expected main package dir")
+		}
+	})
+	t.Run("ignores test files", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, "main_test.go"), "package main\n")
+		if isMainPackageDir(dir) {
+			t.Error("expected non-main dir (only test file)")
+		}
+	})
+	t.Run("ignores underscore file", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, "_main.go"), "package main\n")
+		if isMainPackageDir(dir) {
+			t.Error("expected non-main dir (underscore file)")
+		}
+	})
+	t.Run("non-main", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, "lib.go"), "package lib\n")
+		if isMainPackageDir(dir) {
+			t.Error("expected non-main dir")
+		}
+	})
+}
+
+func TestFindMainPackageDirs(t *testing.T) {
+	t.Run("root only", func(t *testing.T) {
+		src := t.TempDir()
+		writeTestFile(t, filepath.Join(src, "main.go"), "package main\n")
+		got, err := findMainPackageDirs(src)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(got) != 1 || got[0] != "" {
+			t.Errorf("got %v, want [\"\"]", got)
+		}
+	})
+
+	t.Run("cmd subdir only", func(t *testing.T) {
+		src := t.TempDir()
+		writeTestFile(t, filepath.Join(src, "internal.go"), "package internal\n")
+		cmdDir := filepath.Join(src, "cmd", "lazy-skill-mcp")
+		if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(cmdDir, "main.go"), "package main\n")
+		got, err := findMainPackageDirs(src)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(got) != 1 || got[0] != "cmd/lazy-skill-mcp" {
+			t.Errorf("got %v, want [cmd/lazy-skill-mcp]", got)
+		}
+	})
+
+	t.Run("root and cmd both main", func(t *testing.T) {
+		src := t.TempDir()
+		writeTestFile(t, filepath.Join(src, "main.go"), "package main\n")
+		cmdDir := filepath.Join(src, "cmd", "tool")
+		if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(cmdDir, "main.go"), "package main\n")
+		got, err := findMainPackageDirs(src)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(got) != 2 || got[0] != "" || got[1] != "cmd/tool" {
+			t.Errorf("got %v, want [\"\", cmd/tool]", got)
+		}
+	})
+
+	t.Run("no main package", func(t *testing.T) {
+		src := t.TempDir()
+		writeTestFile(t, filepath.Join(src, "lib.go"), "package lib\n")
+		got, err := findMainPackageDirs(src)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want empty", got)
+		}
+	})
+
+	t.Run("skips vendor and testdata and hidden", func(t *testing.T) {
+		src := t.TempDir()
+		for _, d := range []string{"vendor/x", "testdata/skills", ".hidden"} {
+			if err := os.MkdirAll(filepath.Join(src, d), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(src, d, "main.go"), "package main\n")
+		}
+		got, err := findMainPackageDirs(src)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want empty (vendor/testdata/hidden skipped)", got)
+		}
+	})
+}
+
+func TestPickMainPackage(t *testing.T) {
+	t.Run("single auto-detected", func(t *testing.T) {
+		src := t.TempDir()
+		cmdDir := filepath.Join(src, "cmd", "app")
+		if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(cmdDir, "main.go"), "package main\n")
+		got, err := pickMainPackage(src, "", "")
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if got != "cmd/app" {
+			t.Errorf("got %q, want cmd/app", got)
+		}
+	})
+
+	t.Run("multiple prefers root", func(t *testing.T) {
+		src := t.TempDir()
+		writeTestFile(t, filepath.Join(src, "main.go"), "package main\n")
+		cmdDir := filepath.Join(src, "cmd", "other")
+		if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(cmdDir, "main.go"), "package main\n")
+		got, err := pickMainPackage(src, "", "")
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if got != "" {
+			t.Errorf("got %q, want \"\" (root)", got)
+		}
+	})
+
+	t.Run("multiple no root errors", func(t *testing.T) {
+		src := t.TempDir()
+		for _, sub := range []string{"cmd/a", "cmd/b"} {
+			d := filepath.Join(src, sub)
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(d, "main.go"), "package main\n")
+		}
+		if _, err := pickMainPackage(src, "", ""); err == nil {
+			t.Error("expected error for multiple non-root main packages")
+		}
+	})
+
+	t.Run("explicit wins", func(t *testing.T) {
+		src := t.TempDir()
+		for _, sub := range []string{"cmd/a", "cmd/b"} {
+			d := filepath.Join(src, sub)
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(d, "main.go"), "package main\n")
+		}
+		got, err := pickMainPackage(src, "cmd/b", "")
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if got != "cmd/b" {
+			t.Errorf("got %q, want cmd/b", got)
+		}
+	})
+
+	t.Run("explicit invalid dir", func(t *testing.T) {
+		src := t.TempDir()
+		if _, err := pickMainPackage(src, "cmd/nope", ""); err == nil {
+			t.Error("expected error for non-existent explicit dir")
+		}
+	})
+
+	t.Run("explicit non-main dir", func(t *testing.T) {
+		src := t.TempDir()
+		d := filepath.Join(src, "lib")
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(d, "lib.go"), "package lib\n")
+		if _, err := pickMainPackage(src, "lib", ""); err == nil {
+			t.Error("expected error for non-main explicit dir")
+		}
+	})
+
+	t.Run("persisted reused when valid", func(t *testing.T) {
+		src := t.TempDir()
+		for _, sub := range []string{"cmd/a", "cmd/b"} {
+			d := filepath.Join(src, sub)
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(d, "main.go"), "package main\n")
+		}
+		got, err := pickMainPackage(src, "", "cmd/a")
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if got != "cmd/a" {
+			t.Errorf("got %q, want cmd/a (persisted)", got)
+		}
+	})
+
+	t.Run("persisted falls back when invalid", func(t *testing.T) {
+		src := t.TempDir()
+		cmdDir := filepath.Join(src, "cmd", "only")
+		if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(cmdDir, "main.go"), "package main\n")
+		got, err := pickMainPackage(src, "", "cmd/gone")
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if got != "cmd/only" {
+			t.Errorf("got %q, want cmd/only (fallback)", got)
+		}
+	})
+
+	t.Run("no main package errors", func(t *testing.T) {
+		src := t.TempDir()
+		writeTestFile(t, filepath.Join(src, "lib.go"), "package lib\n")
+		if _, err := pickMainPackage(src, "", ""); err == nil {
+			t.Error("expected error when no main package exists")
+		}
+	})
+}
+
+func TestReadBuildPath(t *testing.T) {
+	t.Run("missing file", func(t *testing.T) {
+		dir := t.TempDir()
+		if got := readBuildPath(dir); got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+	t.Run("reads and trims", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, "buildpath"), "  cmd/x \n")
+		if got := readBuildPath(dir); got != "cmd/x" {
+			t.Errorf("got %q, want cmd/x", got)
+		}
+	})
+}
+
 func TestCacheKey(t *testing.T) {
 	tests := []struct {
 		name string

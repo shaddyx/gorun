@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,9 +29,15 @@ Flags:
   --upgrade-all  re-query git and rebuild every cached project, then exit
   --clean        wipe the entire gorun cache, then exit
   --verbose      show the full process output without suppression
+  --main <dir>   module-relative path to the main package to build
 
 The first positional argument is the git URL; everything after it is
 forwarded verbatim to the application.
+
+By default the main package is auto-detected: a repo whose binary lives in a
+subdirectory (e.g. cmd/<name>) is located and built automatically. If several
+main packages exist, or to pin a specific one, pass --main <dir>:
+  gorun --main cmd/lazy-skill-mcp github.com/shaddyx/lazy-skills-mcp
 
 Pin a version with an @ref suffix, recognized only after the first '/':
   gorun github.com/user/repo@v1.0.2   # exact tag
@@ -43,6 +51,7 @@ func main() {
 	upgradeAll := flag.Bool("upgrade-all", false, "re-query git and rebuild every cached project")
 	clean := flag.Bool("clean", false, "wipe the entire gorun cache")
 	verbose := flag.Bool("verbose", false, "show the full process output without suppression")
+	mainDir := flag.String("main", "", "module-relative path to the main package to build (default: auto-detect)")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
 
@@ -79,12 +88,12 @@ func main() {
 	url := args[0]
 	appArgs := args[1:]
 
-	if err := run(cacheRoot, url, appArgs, *upgrade, *verbose); err != nil {
+	if err := run(cacheRoot, url, appArgs, *upgrade, *verbose, *mainDir); err != nil {
 		fatal("%v", err)
 	}
 }
 
-func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool) error {
+func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool, mainDir string) error {
 	repoURL, ref := parseRef(url)
 	repoURL = normalizeURL(repoURL)
 
@@ -144,7 +153,15 @@ func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool) error {
 	}
 
 	if needBuild {
-		if err := goBuild(srcDir, binPath); err != nil {
+		persisted := readBuildPath(dir)
+		pkg, err := pickMainPackage(srcDir, mainDir, persisted)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "buildpath"), []byte(pkg), 0o644); err != nil {
+			return err
+		}
+		if err := goBuild(srcDir, binPath, pkg); err != nil {
 			return err
 		}
 	}
@@ -199,7 +216,15 @@ func upgradeAllCached(cacheRoot string, verbose bool) error {
 		if err := gitPull(srcDir, ref, verbose); err != nil {
 			return err
 		}
-		if err := goBuild(srcDir, binPath); err != nil {
+		persisted := readBuildPath(dir)
+		pkg, perr := pickMainPackage(srcDir, "", persisted)
+		if perr != nil {
+			return perr
+		}
+		if err := os.WriteFile(filepath.Join(dir, "buildpath"), []byte(pkg), 0o644); err != nil {
+			return err
+		}
+		if err := goBuild(srcDir, binPath, pkg); err != nil {
 			return err
 		}
 	}
@@ -254,13 +279,162 @@ func runQuiet(cmd *exec.Cmd) error {
 	return nil
 }
 
-func goBuild(srcDir, binPath string) error {
+func goBuild(srcDir, binPath, pkg string) error {
+	target := "."
+	if pkg != "" {
+		target = "./" + pkg
+	}
 	fmt.Printf("building %s\n", binPath)
-	cmd := exec.Command("go", "build", "-o", binPath, ".")
+	cmd := exec.Command("go", "build", "-o", binPath, target)
 	cmd.Dir = srcDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// normalizePkgPath normalizes a module-relative package path like "./cmd/x" or
+// "/cmd/x" into "cmd/x".
+func normalizePkgPath(p string) string {
+	p = strings.TrimPrefix(p, "/")
+	p = strings.TrimPrefix(p, "./")
+	return strings.TrimSuffix(p, "/")
+}
+
+// readBuildPath reads the previously persisted main-package path, if any.
+func readBuildPath(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, "buildpath"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// pickMainPackage returns the module-relative path of the main package to build.
+// An explicit path wins; otherwise a previously persisted path is reused if it is
+// still valid; otherwise the main package is auto-detected. It returns "" when
+// the module root is the main package.
+func pickMainPackage(srcDir, explicit, persisted string) (string, error) {
+	explicit = normalizePkgPath(explicit)
+	persisted = normalizePkgPath(persisted)
+
+	if explicit != "" {
+		return validateMainPackageDir(srcDir, explicit)
+	}
+	if persisted != "" {
+		if _, err := validateMainPackageDir(srcDir, persisted); err == nil {
+			return persisted, nil
+		}
+	}
+
+	dirs, err := findMainPackageDirs(srcDir)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case len(dirs) == 0:
+		return "", errors.New("no main package (package main) found in repository")
+	case len(dirs) == 1:
+		return dirs[0], nil
+	}
+	for _, d := range dirs {
+		if d == "" {
+			return "", nil
+		}
+	}
+	return "", fmt.Errorf("multiple main packages found (%s); pick one with --main", strings.Join(dirs, ", "))
+}
+
+func validateMainPackageDir(srcDir, rel string) (string, error) {
+	p := filepath.Join(srcDir, filepath.FromSlash(rel))
+	info, err := os.Stat(p)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("--main path %q is not a directory", rel)
+	}
+	if !isMainPackageDir(p) {
+		return "", fmt.Errorf("--main path %q does not contain a main package", rel)
+	}
+	return rel, nil
+}
+
+// findMainPackageDirs returns the module-relative paths of every directory in
+// srcDir that declares "package main" in a non-test .go file. The module root is
+// represented by "". Hidden dirs, vendor/, and testdata/ are skipped. Results
+// are sorted and de-duplicated.
+func findMainPackageDirs(srcDir string) ([]string, error) {
+	var dirs []string
+	err := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			return nil
+		}
+		if path != srcDir {
+			name := info.Name()
+			if strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata" {
+				return filepath.SkipDir
+			}
+		}
+		if isMainPackageDir(path) {
+			rel, relErr := filepath.Rel(srcDir, path)
+			if relErr != nil {
+				return nil
+			}
+			dirRel := ""
+			if rel != "." {
+				dirRel = filepath.ToSlash(rel)
+			}
+			dirs = append(dirs, dirRel)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(dirs)
+	return dirs, nil
+}
+
+func isMainPackageDir(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		if strings.HasPrefix(n, "_") || strings.HasPrefix(n, ".") {
+			continue
+		}
+		if isMainPackageFile(filepath.Join(dir, n)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isMainPackageFile reports whether the .go file's package clause is "main".
+var packageClauseRe = regexp.MustCompile(`^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)`)
+
+func isMainPackageFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		m := packageClauseRe.FindStringSubmatch(sc.Text())
+		if m != nil {
+			return m[1] == "main"
+		}
+	}
+	return false
 }
 
 func execApp(binPath string, appArgs []string) error {

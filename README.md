@@ -54,6 +54,13 @@ gorun github.com/user/repo@main
 # Highest semver release (or the default branch if untagged);
 # re-resolved only on --upgrade
 gorun github.com/user/repo@latest
+
+# Repos where the main package lives in a subdirectory are auto-detected:
+# e.g. lazy-skills-mcp has its binary in cmd/lazy-skill-mcp
+gorun github.com/shaddyx/lazy-skills-mcp --list
+
+# If a repo has several main packages, pick one explicitly:
+gorun --main cmd/mytool github.com/user/repo
 ```
 
 The first positional argument is the git URL; everything after it is forwarded
@@ -85,6 +92,7 @@ cloning, so both `github.com/user/repo@v1.0.2` and
 | `--upgrade-all` | Re-query git and rebuild every cached project, then exit.         |
 | `--clean`       | Wipe the entire gorun cache, then exit.                           |
 | `--verbose`     | Show the full process output (git clone/pull) without suppression. |
+| `--main <dir>`  | Module-relative path to the `main` package to build (default: auto-detect). |
 
 `--clean` and `--upgrade-all` are mutually exclusive.
 
@@ -101,7 +109,8 @@ Pass `--verbose` to stream it live.
 2. The project is cloned into `$XDG_CACHE_HOME/gorun/<key>/src`
    (default `~/.cache/gorun/<key>/src`); if an `@ref` is present the clone is
    pinned to it via `git clone --depth 1 --branch <ref>`.
-3. The binary is built into `<key>/bin/<name>`.
+3. The main package is located (auto-detected by scanning for `package main`,
+   or specified with `--main`), then built into `<key>/bin/<name>`.
 4. On subsequent runs the cached binary is reused — no clone or build.
 5. `--upgrade` re-pulls and rebuilds; `--upgrade-all` does this for every cached
    project.
