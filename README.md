@@ -61,6 +61,12 @@ gorun github.com/shaddyx/lazy-skills-mcp --list
 
 # If a repo has several main packages, pick one explicitly:
 gorun --main cmd/mytool github.com/user/repo
+
+# Run a bundle from a subdirectory via a git-host "browse directory" link:
+# the repo is cloned at the branch in the URL and the main package in the
+# subpath is built (a subpath with its own go.mod is built as a nested module).
+# The binary is named after the last subpath segment:
+gorun github.com/MegaFair/mf-ai-tools/tree/main/mcp-servers/grafana-logs-downloader
 ```
 
 The first positional argument is the git URL; everything after it is forwarded
@@ -84,6 +90,26 @@ Schemeless URLs (`github.com/user/repo`) are normalized to `https://` before
 cloning, so both `github.com/user/repo@v1.0.2` and
 `https://github.com/user/repo@v1.0.2` resolve to the same cache entry.
 
+A `/tree/<branch>/<path>` URL (the "browse directory" link that git hosts put
+in their address bars) points at a subdirectory of the repo:
+
+```bash
+gorun github.com/MegaFair/mf-ai-tools/tree/main/mcp-servers/grafana-logs-downloader
+```
+
+The repo is cloned at the branch from the URL, the main package in `<path>` is
+built (a `<path>` that carries its own `go.mod` is built as a nested module),
+and the binary is named after the last `<path>` segment — here
+`grafana-logs-downloader`. Trailing `?query` and `#fragment` parts copied from
+a browser are ignored, and percent-encoded segments (e.g. `%2F` in branch
+names) are decoded. A tree URL with a subpath maps to a single stable cache
+entry regardless of the branch (like `@latest`): `--upgrade` re-fetches,
+checks out the branch from the URL, and rebuilds. A tree URL without a
+subpath (just `/tree/<branch>`) is keyed per branch, like `@<branch>`.
+`--main <dir>` overrides `<path>` when you want a different main package than
+the one the URL points at. Only `/tree/` URLs are supported; `/blob/` file
+links are not.
+
 ## Flags
 
 | Flag            | Description                                                       |
@@ -92,7 +118,7 @@ cloning, so both `github.com/user/repo@v1.0.2` and
 | `--upgrade-all` | Re-query git and rebuild every cached project, then exit.         |
 | `--clean`       | Wipe the entire gorun cache, then exit.                           |
 | `--verbose`     | Show the full process output (git clone/pull) without suppression. |
-| `--main <dir>`  | Module-relative path to the `main` package to build (default: auto-detect). |
+| `--main <dir>`  | Module-relative path to the `main` package to build (default: the `/tree/` subpath, or auto-detect). |
 
 `--clean` and `--upgrade-all` are mutually exclusive.
 
@@ -105,12 +131,16 @@ Pass `--verbose` to stream it live.
    (version/branch/commit) is included in the key, so each version is cached
    separately. `@latest` always maps to a single stable cache entry (keyed on
    the literal `@latest`); it is resolved on the first run and re-resolved only
-   on `--upgrade`.
-2. The project is cloned into `$XDG_CACHE_HOME/gorun/<key>/src`
-   (default `~/.cache/gorun/<key>/src`); if an `@ref` is present the clone is
-   pinned to it via `git clone --depth 1 --branch <ref>`.
-3. The main package is located (auto-detected by scanning for `package main`,
-   or specified with `--main`), then built into `<key>/bin/<name>`.
+   on `--upgrade`. A `/tree/` URL with a subpath is keyed on the base
+   repository URL alone, so every branch of the same bundle shares one entry.
+2. The project is cloned into `$XDG_CACHE_HOME/gorun/<name>-<key>/src`
+   (default `~/.cache/gorun/<name>-<key>/src`); if an `@ref` or `/tree/`
+   branch is present the clone is pinned to it via
+   `git clone --depth 1 --branch <ref>`.
+3. The main package is located — `--main` when given, then the `/tree/`
+   subpath, then auto-detection by scanning for `package main` — and built
+   into `<key>/bin/<name>`, where `<name>` is the last subpath segment of a
+   `/tree/` URL or the repository name.
 4. On subsequent runs the cached binary is reused — no clone or build.
 5. `--upgrade` re-pulls and rebuilds; `--upgrade-all` does this for every cached
    project.

@@ -2,7 +2,9 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -535,4 +537,356 @@ func TestCacheRoot(t *testing.T) {
 			t.Errorf("cacheRoot() = %q, want %q", got, want)
 		}
 	})
+}
+
+func TestParseTreeURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		wantBase string
+		wantRef  string
+		wantSub  string
+		wantOK   bool
+	}{
+		{
+			name:     "github https tree url",
+			url:      "https://github.com/MegaFair/mf-ai-tools/tree/main/mcp-servers/grafana-logs-downloader",
+			wantBase: "https://github.com/MegaFair/mf-ai-tools",
+			wantRef:  "main",
+			wantSub:  "mcp-servers/grafana-logs-downloader",
+			wantOK:   true,
+		},
+		{
+			name:     "schemeless tree url",
+			url:      "github.com/MegaFair/mf-ai-tools/tree/main/mcp-servers/grafana-logs-downloader",
+			wantBase: "github.com/MegaFair/mf-ai-tools",
+			wantRef:  "main",
+			wantSub:  "mcp-servers/grafana-logs-downloader",
+			wantOK:   true,
+		},
+		{
+			name:     "branch only, no subpath",
+			url:      "https://github.com/o/r/tree/dev",
+			wantBase: "https://github.com/o/r",
+			wantRef:  "dev",
+			wantSub:  "",
+			wantOK:   true,
+		},
+		{
+			name:     "trailing slash",
+			url:      "https://github.com/o/r/tree/main/cmd/app/",
+			wantBase: "https://github.com/o/r",
+			wantRef:  "main",
+			wantSub:  "cmd/app",
+			wantOK:   true,
+		},
+		{
+			name:     "query and fragment stripped",
+			url:      "https://github.com/o/r/tree/main/mcp-servers/tool?tab=readme#L10",
+			wantBase: "https://github.com/o/r",
+			wantRef:  "main",
+			wantSub:  "mcp-servers/tool",
+			wantOK:   true,
+		},
+		{
+			name:     "percent encoded branch",
+			url:      "https://github.com/o/r/tree/feature%2Fx/mcp-servers/tool",
+			wantBase: "https://github.com/o/r",
+			wantRef:  "feature/x",
+			wantSub:  "mcp-servers/tool",
+			wantOK:   true,
+		},
+		{
+			name:     "gitlab nested groups",
+			url:      "https://gitlab.com/group/subgroup/project/tree/main/tools/api",
+			wantBase: "https://gitlab.com/group/subgroup/project",
+			wantRef:  "main",
+			wantSub:  "tools/api",
+			wantOK:   true,
+		},
+		{
+			name:     "subpath containing tree",
+			url:      "https://github.com/o/r/tree/main/tree-tools/mcp-servers/tool",
+			wantBase: "https://github.com/o/r",
+			wantRef:  "main",
+			wantSub:  "tree-tools/mcp-servers/tool",
+			wantOK:   true,
+		},
+		{
+			name:     "plain url not a tree url",
+			url:      "https://github.com/o/r",
+			wantBase: "",
+			wantRef:  "",
+			wantSub:  "",
+			wantOK:   false,
+		},
+		{
+			name:     "at ref url not a tree url",
+			url:      "https://github.com/o/r@v1.0.2",
+			wantBase: "",
+			wantRef:  "",
+			wantSub:  "",
+			wantOK:   false,
+		},
+		{
+			name:     "ssh url not a tree url",
+			url:      "git@github.com:o/r.git",
+			wantBase: "",
+			wantRef:  "",
+			wantSub:  "",
+			wantOK:   false,
+		},
+		{
+			name:     "empty url",
+			url:      "",
+			wantBase: "",
+			wantRef:  "",
+			wantSub:  "",
+			wantOK:   false,
+		},
+		{
+			name:     "tree with empty ref",
+			url:      "https://github.com/o/r/tree/main",
+			wantBase: "https://github.com/o/r",
+			wantRef:  "main",
+			wantSub:  "",
+			wantOK:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base, ref, sub, ok := parseTreeURL(tt.url)
+			if ok != tt.wantOK {
+				t.Fatalf("parseTreeURL(%q) ok = %v, want %v (base=%q ref=%q sub=%q)", tt.url, ok, tt.wantOK, base, ref, sub)
+			}
+			if !tt.wantOK {
+				return
+			}
+			if base != tt.wantBase {
+				t.Errorf("base = %q, want %q", base, tt.wantBase)
+			}
+			if ref != tt.wantRef {
+				t.Errorf("ref = %q, want %q", ref, tt.wantRef)
+			}
+			if sub != tt.wantSub {
+				t.Errorf("subPath = %q, want %q", sub, tt.wantSub)
+			}
+		})
+	}
+}
+
+func TestSplitTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		wantRepo string
+		wantRef  string
+		wantSub  string
+	}{
+		{
+			name:     "tree url",
+			url:      "github.com/MegaFair/mf-ai-tools/tree/main/mcp-servers/grafana-logs-downloader",
+			wantRepo: "https://github.com/MegaFair/mf-ai-tools",
+			wantRef:  "main",
+			wantSub:  "mcp-servers/grafana-logs-downloader",
+		},
+		{
+			name:     "plain url no ref",
+			url:      "github.com/user/repo",
+			wantRepo: "https://github.com/user/repo",
+			wantRef:  "",
+			wantSub:  "",
+		},
+		{
+			name:     "plain url with ref",
+			url:      "github.com/user/repo@v1.0.2",
+			wantRepo: "https://github.com/user/repo",
+			wantRef:  "v1.0.2",
+			wantSub:  "",
+		},
+		{
+			name:     "ssh url unchanged",
+			url:      "git@github.com:user/repo.git@v1.0.1",
+			wantRepo: "git@github.com:user/repo.git",
+			wantRef:  "v1.0.1",
+			wantSub:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, ref, sub := splitTarget(tt.url)
+			if repo != tt.wantRepo {
+				t.Errorf("repo = %q, want %q", repo, tt.wantRepo)
+			}
+			if ref != tt.wantRef {
+				t.Errorf("ref = %q, want %q", ref, tt.wantRef)
+			}
+			if sub != tt.wantSub {
+				t.Errorf("subPath = %q, want %q", sub, tt.wantSub)
+			}
+		})
+	}
+}
+
+func TestKeySource(t *testing.T) {
+	tests := []struct {
+		name    string
+		repo    string
+		ref     string
+		subPath string
+		want    string
+	}{
+		{
+			name:    "tree url keyed on base repo only",
+			repo:    "https://github.com/MegaFair/mf-ai-tools",
+			ref:     "main",
+			subPath: "mcp-servers/grafana-logs-downloader",
+			want:    "https://github.com/MegaFair/mf-ai-tools",
+		},
+		{
+			name:    "branch only tree url keyed on base repo only",
+			repo:    "https://github.com/o/r",
+			ref:     "dev",
+			subPath: "",
+			want:    "https://github.com/o/r@dev",
+		},
+		{
+			name:    "plain url with ref",
+			repo:    "https://github.com/user/repo",
+			ref:     "v1.0.2",
+			subPath: "",
+			want:    "https://github.com/user/repo@v1.0.2",
+		},
+		{
+			name:    "plain url without ref",
+			repo:    "https://github.com/user/repo",
+			ref:     "",
+			subPath: "",
+			want:    "https://github.com/user/repo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := keySource(tt.repo, tt.ref, tt.subPath); got != tt.want {
+				t.Errorf("keySource(%q, %q, %q) = %q, want %q", tt.repo, tt.ref, tt.subPath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTargetName(t *testing.T) {
+	tests := []struct {
+		name    string
+		repo    string
+		subPath string
+		want    string
+	}{
+		{name: "tree subpath", repo: "https://github.com/MegaFair/mf-ai-tools", subPath: "mcp-servers/grafana-logs-downloader", want: "grafana-logs-downloader"},
+		{name: "single segment subpath", repo: "https://github.com/o/r", subPath: "tools", want: "tools"},
+		{name: "no subpath", repo: "https://github.com/user/repo", subPath: "", want: "repo"},
+		{name: "no subpath with .git", repo: "https://github.com/user/repo.git", subPath: "", want: "repo"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := targetName(tt.repo, tt.subPath); got != tt.want {
+				t.Errorf("targetName(%q, %q) = %q, want %q", tt.repo, tt.subPath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGoBuildBuildsInPackageDir(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+
+	src := t.TempDir()
+	// Root module that is NOT a main package on its own.
+	writeTestFile(t, filepath.Join(src, "go.mod"), "module example.com/root\n\ngo 1.21\n")
+	writeTestFile(t, filepath.Join(src, "lib.go"), "package root\n\nfunc Helper() string { return \"root-helper\" }\n")
+
+	// Nested module with its own go.mod and a main package.
+	nested := filepath.Join(src, "tools", "mytool")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(nested, "go.mod"), "module example.com/tools/mytool\n\ngo 1.21\n")
+	writeTestFile(t, filepath.Join(nested, "main.go"),
+		"package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"mytool ran\") }\n")
+
+	binPath := filepath.Join(t.TempDir(), "mytool")
+	if err := goBuild(src, binPath, "tools/mytool"); err != nil {
+		t.Fatalf("goBuild error = %v", err)
+	}
+	if _, err := os.Stat(binPath); err != nil {
+		t.Fatalf("binary not created at %s: %v", binPath, err)
+	}
+
+	out, err := exec.Command(binPath).Output()
+	if err != nil {
+		t.Fatalf("running built binary: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "mytool ran" {
+		t.Errorf("binary output = %q, want %q", got, "mytool ran")
+	}
+}
+
+func TestGitPullTracksRemoteBranch(t *testing.T) {
+	gitBin, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	originDir := filepath.Join(root, "origin.git")
+	workDir := filepath.Join(root, "work")
+	srcDir := filepath.Join(root, "clone")
+
+	gitRun := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command(gitBin, args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v (dir %s) failed: %v\n%s", args, dir, err, out)
+		}
+	}
+	commit := func(dir string, msg string) {
+		t.Helper()
+		gitRun(dir, "-c", "user.email=t@t.co", "-c", "user.name=t", "commit", "-m", msg)
+	}
+
+	// Origin: bare repo with a first version of main.go on branch main.
+	gitRun(root, "init", "--bare", "--initial-branch=main", originDir)
+	gitRun(root, "init", "--initial-branch=main", workDir)
+	writeTestFile(t, filepath.Join(workDir, "main.go"), "package main\n\nfunc main() {}\n")
+	gitRun(workDir, "-c", "user.email=t@t.co", "-c", "user.name=t", "add", "main.go")
+	commit(workDir, "v1")
+	gitRun(workDir, "remote", "add", "origin", originDir)
+	gitRun(workDir, "push", "origin", "main")
+
+	// Clone it; the clone's local main branch now points at v1.
+	gitRun(root, "clone", originDir, srcDir)
+
+	// Push a second version to origin; the clone's local main is still stale.
+	writeTestFile(t, filepath.Join(workDir, "main.go"), "package main\n\nfunc main() { println(\"v2\") }\n")
+	gitRun(workDir, "-c", "user.email=t@t.co", "-c", "user.name=t", "add", "main.go")
+	commit(workDir, "v2")
+	gitRun(workDir, "push", "origin", "main")
+
+	if err := gitPull(srcDir, "main", false); err != nil {
+		t.Fatalf("gitPull error = %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(srcDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "v2") {
+		t.Errorf("after gitPull, main.go does not contain v2: %q", string(got))
+	}
 }

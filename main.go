@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -30,6 +31,7 @@ Flags:
   --clean        wipe the entire gorun cache, then exit
   --verbose      show the full process output without suppression
   --main <dir>   module-relative path to the main package to build
+                 (overrides the subdirectory implied by a /tree/ URL)
 
 The first positional argument is the git URL; everything after it is
 forwarded verbatim to the application.
@@ -38,6 +40,13 @@ By default the main package is auto-detected: a repo whose binary lives in a
 subdirectory (e.g. cmd/<name>) is located and built automatically. If several
 main packages exist, or to pin a specific one, pass --main <dir>:
   gorun --main cmd/lazy-skill-mcp github.com/shaddyx/lazy-skills-mcp
+
+A /tree/<branch>/<path> URL (a "browse directory" link) points at a
+subdirectory of the repo. The repo is cloned at that branch and the main
+package in <path> is built — a <path> with its own go.mod is built as a
+nested module. The binary is named after the last <path> segment:
+  gorun github.com/MegaFair/mf-ai-tools/tree/main/mcp-servers/grafana-logs-downloader
+All branches of the same bundle share one cache entry, like @latest.
 
 Pin a version with an @ref suffix, recognized only after the first '/':
   gorun github.com/user/repo@v1.0.2   # exact tag
@@ -94,17 +103,14 @@ func main() {
 }
 
 func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool, mainDir string) error {
-	repoURL, ref := parseRef(url)
-	repoURL = normalizeURL(repoURL)
+	repoURL, ref, subPath := splitTarget(url)
 
 	// The cache key uses the literal ref ("latest" stays "latest"), so @latest
-	// always maps to the same stable cache dir regardless of the resolved version.
-	keySource := repoURL
-	if ref != "" {
-		keySource = repoURL + "@" + ref
-	}
-	key := cacheKey(keySource)
-	name := repoName(url)
+	// always maps to the same stable cache dir regardless of the resolved
+	// version. /tree/ URLs are keyed on the base repo URL alone, so every
+	// branch of the same bundle shares one stable cache entry.
+	key := cacheKey(keySource(repoURL, ref, subPath))
+	name := targetName(repoURL, subPath)
 	dir := filepath.Join(cacheRoot, name+"-"+key)
 	srcDir := filepath.Join(dir, "src")
 	binDir := filepath.Join(dir, "bin")
@@ -154,7 +160,11 @@ func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool, mainDir
 
 	if needBuild {
 		persisted := readBuildPath(dir)
-		pkg, err := pickMainPackage(srcDir, mainDir, persisted)
+		explicit := subPath
+		if mainDir != "" {
+			explicit = mainDir
+		}
+		pkg, err := pickMainPackage(srcDir, explicit, persisted)
 		if err != nil {
 			return err
 		}
@@ -195,21 +205,31 @@ func upgradeAllCached(cacheRoot string, verbose bool) error {
 		}
 
 		ref := ""
+		subPath := ""
+		name := ""
 		if b, err := os.ReadFile(filepath.Join(dir, "url")); err == nil {
-			repoURL, r := parseRef(strings.TrimSpace(string(b)))
-			repoURL = normalizeURL(repoURL)
-			if r == "latest" {
-				resolved, rerr := resolveLatest(repoURL)
-				if rerr != nil {
-					return fmt.Errorf("resolving @latest for %s: %w", e.Name(), rerr)
-				}
-				ref = resolved
+			raw := strings.TrimSpace(string(b))
+			if baseRepo, treeRef, sub, isTree := parseTreeURL(raw); isTree {
+				name = targetName(normalizeURL(baseRepo), sub)
+				ref = treeRef
+				subPath = sub
 			} else {
-				ref = r
+				repoURL, r := parseRef(raw)
+				repoURL = normalizeURL(repoURL)
+				if r == "latest" {
+					resolved, rerr := resolveLatest(repoURL)
+					if rerr != nil {
+						return fmt.Errorf("resolving @latest for %s: %w", e.Name(), rerr)
+					}
+					ref = resolved
+				} else {
+					ref = r
+				}
 			}
 		}
-
-		name := repoNameFromDir(srcDir)
+		if name == "" {
+			name = repoNameFromDir(srcDir)
+		}
 		binPath := filepath.Join(binDir, name)
 
 		fmt.Printf("upgrading %s\n", e.Name())
@@ -217,7 +237,7 @@ func upgradeAllCached(cacheRoot string, verbose bool) error {
 			return err
 		}
 		persisted := readBuildPath(dir)
-		pkg, perr := pickMainPackage(srcDir, "", persisted)
+		pkg, perr := pickMainPackage(srcDir, subPath, persisted)
 		if perr != nil {
 			return perr
 		}
@@ -249,11 +269,22 @@ func gitPull(srcDir, ref string, verbose bool) error {
 		return err
 	}
 	target := ref
-	if target == "" {
+	switch {
+	case target == "":
 		target = "origin/HEAD"
+	case hasRemoteBranch(srcDir, target):
+		// A pinned branch: reset to the freshly fetched remote-tracking ref.
+		// A bare branch name would resolve to the stale local branch.
+		target = "origin/" + target
 	}
 	cmd = exec.Command("git", "-C", srcDir, "reset", "--hard", target)
 	return runGit(cmd, verbose)
+}
+
+// hasRemoteBranch reports whether ref names a branch on the origin remote.
+func hasRemoteBranch(srcDir, ref string) bool {
+	out, err := exec.Command("git", "-C", srcDir, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+ref).Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
 }
 
 // runGit runs cmd, streaming output when verbose, otherwise capturing it and
@@ -280,13 +311,15 @@ func runQuiet(cmd *exec.Cmd) error {
 }
 
 func goBuild(srcDir, binPath, pkg string) error {
-	target := "."
+	buildDir := srcDir
 	if pkg != "" {
-		target = "./" + pkg
+		buildDir = filepath.Join(srcDir, filepath.FromSlash(pkg))
 	}
 	fmt.Printf("building %s\n", binPath)
-	cmd := exec.Command("go", "build", "-o", binPath, target)
-	cmd.Dir = srcDir
+	// Build "." inside the target package so a subdirectory with its own
+	// go.mod (a nested module) is built in its own module context.
+	cmd := exec.Command("go", "build", "-o", binPath, ".")
+	cmd.Dir = buildDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -348,10 +381,10 @@ func validateMainPackageDir(srcDir, rel string) (string, error) {
 	p := filepath.Join(srcDir, filepath.FromSlash(rel))
 	info, err := os.Stat(p)
 	if err != nil || !info.IsDir() {
-		return "", fmt.Errorf("--main path %q is not a directory", rel)
+		return "", fmt.Errorf("main package path %q is not a directory", rel)
 	}
 	if !isMainPackageDir(p) {
-		return "", fmt.Errorf("--main path %q does not contain a main package", rel)
+		return "", fmt.Errorf("main package path %q does not contain a main package", rel)
 	}
 	return rel, nil
 }
@@ -501,6 +534,99 @@ func parseRef(url string) (string, string) {
 		return url[:at], url[at+1:]
 	}
 	return url, ""
+}
+
+// parseTreeURL splits a git-host "tree" URL (the "browse directory" link form
+// used by GitHub, GitLab, and Gitea) into the base repository URL, the ref
+// shown in the URL, and the module-relative subdirectory:
+//
+//	github.com/o/r/tree/main/mcp-servers/tool
+//	    -> baseRepo "github.com/o/r", ref "main", subPath "mcp-servers/tool"
+//
+// Trailing ?query and #fragment (browser copy artifacts) are stripped, and
+// percent-encoded path segments are decoded (e.g. branch names containing
+// '/'). ok is false for URLs without a /tree/ marker.
+func parseTreeURL(url string) (baseRepo, ref, subPath string, ok bool) {
+	u := url
+	if i := strings.IndexByte(u, '?'); i >= 0 {
+		u = u[:i]
+	}
+	if i := strings.IndexByte(u, '#'); i >= 0 {
+		u = u[:i]
+	}
+	const marker = "/tree/"
+	i := strings.Index(u, marker)
+	if i < 0 {
+		return "", "", "", false
+	}
+	baseRepo = u[:i]
+	rest := u[i+len(marker):]
+	var sub string
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		ref = decodeURISegment(rest[:slash])
+		parts := strings.Split(rest[slash+1:], "/")
+		for i := range parts {
+			parts[i] = decodeURISegment(parts[i])
+		}
+		sub = strings.Join(parts, "/")
+	} else {
+		ref = decodeURISegment(rest)
+	}
+	sub = strings.TrimSuffix(sub, "/")
+	if baseRepo == "" || ref == "" {
+		return "", "", "", false
+	}
+	return baseRepo, ref, sub, true
+}
+
+// decodeURISegment percent-decodes a URL path segment, returning it unchanged
+// if it is not valid percent-encoding.
+func decodeURISegment(s string) string {
+	if d, err := url.PathUnescape(s); err == nil {
+		return d
+	}
+	return s
+}
+
+// splitTarget splits a user-supplied URL into the repository to clone, an
+// optional ref, and an optional module-relative subdirectory. A /tree/ URL
+// pins all three; any other URL yields a repository and optional @ref only.
+func splitTarget(u string) (repoURL, ref, subPath string) {
+	if base, treeRef, sub, ok := parseTreeURL(u); ok {
+		return normalizeURL(base), treeRef, sub
+	}
+	repo, r := parseRef(u)
+	return normalizeURL(repo), r, ""
+}
+
+// keySource returns the string hashed into the cache key. /tree/ URLs are
+// keyed on the base repository URL alone, so every branch of the same bundle
+// shares one cache entry, like @latest. Plain URLs additionally include the
+// ref, so each version gets its own cache entry.
+func keySource(repoURL, ref, subPath string) string {
+	if subPath != "" {
+		return repoURL
+	}
+	if ref != "" {
+		return repoURL + "@" + ref
+	}
+	return repoURL
+}
+
+// targetName returns the binary (and cache-directory) name for a target: the
+// last segment of a /tree/ subdirectory, or the repository name otherwise.
+func targetName(repoURL, subPath string) string {
+	if subPath != "" {
+		return lastSegment(subPath)
+	}
+	return repoName(repoURL)
+}
+
+func lastSegment(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 // semverTagPattern matches a semver tag with an optional leading "v".
