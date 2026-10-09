@@ -8,12 +8,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +34,8 @@ Flags:
   --verbose      show the full process output without suppression
   --main <dir>   module-relative path to the main package to build
                  (overrides the subdirectory implied by a /tree/ URL)
+  --install      build (or reuse) the target's binary and install it to
+                 $GOBIN (or $(go env GOPATH)/bin), then exit
 
 The first positional argument is the git URL; everything after it is
 forwarded verbatim to the application.
@@ -61,11 +65,13 @@ func main() {
 	clean := flag.Bool("clean", false, "wipe the entire gorun cache")
 	verbose := flag.Bool("verbose", false, "show the full process output without suppression")
 	mainDir := flag.String("main", "", "module-relative path to the main package to build (default: auto-detect)")
+	install := flag.Bool("install", false, "build and install the app binary instead of running it")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
 
-	if *clean && *upgradeAll {
-		fatal("--clean and --upgrade-all are mutually exclusive")
+	args := flag.Args()
+	if err := validateFlags(*install, *clean, *upgradeAll, args); err != nil {
+		fatal("%v", err)
 	}
 
 	cacheRoot, err := cacheRoot()
@@ -88,7 +94,6 @@ func main() {
 		return
 	}
 
-	args := flag.Args()
 	if len(args) == 0 {
 		flag.Usage()
 		os.Exit(2)
@@ -97,12 +102,26 @@ func main() {
 	url := args[0]
 	appArgs := args[1:]
 
-	if err := run(cacheRoot, url, appArgs, *upgrade, *verbose, *mainDir); err != nil {
+	if err := run(cacheRoot, url, appArgs, *upgrade, *verbose, *mainDir, *install); err != nil {
 		fatal("%v", err)
 	}
 }
 
-func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool, mainDir string) error {
+// validateFlags reports invalid flag combinations before any work is done.
+func validateFlags(install, clean, upgradeAll bool, args []string) error {
+	if clean && upgradeAll {
+		return errors.New("--clean and --upgrade-all are mutually exclusive")
+	}
+	if install && (clean || upgradeAll) {
+		return errors.New("--install cannot be combined with --clean or --upgrade-all")
+	}
+	if install && len(args) > 1 {
+		return errors.New("--install does not forward arguments to the app")
+	}
+	return nil
+}
+
+func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool, mainDir string, install bool) error {
 	repoURL, ref, subPath := splitTarget(url)
 
 	// The cache key uses the literal ref ("latest" stays "latest"), so @latest
@@ -176,6 +195,14 @@ func run(cacheRoot, url string, appArgs []string, upgrade, verbose bool, mainDir
 		}
 	}
 
+	if install {
+		dst, err := installApp(binPath, name)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("installed %s\n", dst)
+		return nil
+	}
 	return execApp(binPath, appArgs)
 }
 
@@ -494,6 +521,110 @@ func execApp(binPath string, appArgs []string) error {
 			os.Exit(exitErr.ExitCode())
 		}
 		return err
+	}
+	return nil
+}
+
+// goEnv returns the value of the go environment variable key, as reported by
+// `go env`. Shelling out honors settings made with `go env -w`, which are not
+// exported in the process environment, so we match what `go install` would do.
+func goEnv(key string) (string, error) {
+	out, err := exec.Command("go", "env", key).Output()
+	if err != nil {
+		return "", fmt.Errorf("go env %s: %w", key, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// installDir returns the directory that `go install` writes binaries to: $GOBIN
+// when set, otherwise the bin subdirectory of the first GOPATH entry.
+func installDir() (string, error) {
+	gobin, err := goEnv("GOBIN")
+	if err != nil {
+		return "", err
+	}
+	if gobin != "" {
+		if !filepath.IsAbs(gobin) {
+			return "", fmt.Errorf("GOBIN must be an absolute path, got %q", gobin)
+		}
+		return gobin, nil
+	}
+	gopath, err := goEnv("GOPATH")
+	if err != nil {
+		return "", err
+	}
+	paths := filepath.SplitList(gopath)
+	if len(paths) == 0 || paths[0] == "" {
+		return "", errors.New("cannot determine install directory: GOBIN and GOPATH are both unset")
+	}
+	return filepath.Join(paths[0], "bin"), nil
+}
+
+// validInstallName reports whether name is safe to use as a file name in the
+// install directory. The name is derived from a user-supplied URL, so rejecting
+// path separators (both '/' and the Windows '\') keeps a crafted URL from
+// escaping the install directory via path traversal.
+func validInstallName(name string) bool {
+	return name != "" && name != "." && name != ".." &&
+		!strings.ContainsAny(name, `/\`)
+}
+
+// installApp copies the built binary at binPath into the install directory and
+// returns the destination path. The .exe suffix is appended on Windows to match
+// what `go install` produces.
+func installApp(binPath, name string) (string, error) {
+	if !validInstallName(name) {
+		return "", fmt.Errorf("invalid install name %q", name)
+	}
+	dir, err := installDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("creating install dir %s: %w", dir, err)
+	}
+	dst := filepath.Join(dir, name)
+	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(dst), ".exe") {
+		dst += ".exe"
+	}
+	if err := copyExecutable(binPath, dst); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+// copyExecutable copies src to dst by writing a temp file in dst's directory and
+// renaming it into place, so an interrupted copy never leaves a partial binary
+// at dst.
+func copyExecutable(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", src, err)
+	}
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".gorun-install-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file for %s: %w", dst, err)
+	}
+	tmpName := tmp.Name()
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("copying %s: %w", src, err)
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("setting permissions on %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("closing %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("installing %s: %w", dst, err)
 	}
 	return nil
 }

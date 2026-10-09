@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -888,5 +890,213 @@ func TestGitPullTracksRemoteBranch(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "v2") {
 		t.Errorf("after gitPull, main.go does not contain v2: %q", string(got))
+	}
+}
+
+func TestInstallDir(t *testing.T) {
+	t.Run("GOBIN set is returned verbatim", func(t *testing.T) {
+		if _, err := exec.LookPath("go"); err != nil {
+			t.Skip("go toolchain not available")
+		}
+		t.Setenv("GOENV", "off")
+		want := filepath.Join(t.TempDir(), "custom-bin")
+		t.Setenv("GOBIN", want)
+		got, err := installDir()
+		if err != nil {
+			t.Fatalf("installDir() error = %v", err)
+		}
+		if got != want {
+			t.Errorf("installDir() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("GOBIN unset falls back to GOPATH/bin", func(t *testing.T) {
+		if _, err := exec.LookPath("go"); err != nil {
+			t.Skip("go toolchain not available")
+		}
+		t.Setenv("GOENV", "off")
+		t.Setenv("GOBIN", "")
+		gopath := t.TempDir()
+		t.Setenv("GOPATH", gopath)
+		got, err := installDir()
+		if err != nil {
+			t.Fatalf("installDir() error = %v", err)
+		}
+		if want := filepath.Join(gopath, "bin"); got != want {
+			t.Errorf("installDir() = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestInstallApp(t *testing.T) {
+	srcDir := t.TempDir()
+	src := filepath.Join(srcDir, "myapp")
+	want := []byte("#!/bin/sh\necho hi\n")
+	if err := os.WriteFile(src, want, 0o755); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	destDir := t.TempDir()
+	t.Setenv("GOBIN", destDir)
+
+	dst, err := installApp(src, "myapp")
+	if err != nil {
+		t.Fatalf("installApp() error = %v", err)
+	}
+	if filepath.Dir(dst) != destDir {
+		t.Errorf("installApp() dst = %q, want it inside %q", dst, destDir)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read installed binary %s: %v", dst, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("installed bytes = %q, want %q", got, want)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(dst)
+		if err != nil {
+			t.Fatalf("stat installed binary %s: %v", dst, err)
+		}
+		if info.Mode().Perm()&0o111 == 0 {
+			t.Errorf("installed mode = %v, want executable bits set", info.Mode().Perm())
+		}
+	}
+}
+
+func TestCopyExecutable(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "sub", "dst")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(dst), err)
+	}
+	content := []byte("binary content")
+	if err := os.WriteFile(src, content, 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	if err := copyExecutable(src, dst); err != nil {
+		t.Fatalf("copyExecutable() error = %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("copied content = %q, want %q", got, content)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(dst)
+		if err != nil {
+			t.Fatalf("stat dst: %v", err)
+		}
+		if info.Mode().Perm() != 0o755 {
+			t.Errorf("dst mode = %v, want %v", info.Mode().Perm(), os.FileMode(0o755))
+		}
+	}
+}
+
+func TestCopyExecutableOverwritesExisting(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	if err := os.WriteFile(src, []byte("new content"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if err := os.WriteFile(dst, []byte("stale content that is longer"), 0o644); err != nil {
+		t.Fatalf("write existing dst: %v", err)
+	}
+
+	if err := copyExecutable(src, dst); err != nil {
+		t.Fatalf("copyExecutable() error = %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst: %v", err)
+	}
+	if want := []byte("new content"); !bytes.Equal(got, want) {
+		t.Errorf("dst content = %q, want it replaced with %q", got, want)
+	}
+}
+
+func TestInstallAppRejectsUnsafeName(t *testing.T) {
+	t.Setenv("GOBIN", t.TempDir())
+	src := filepath.Join(t.TempDir(), "myapp")
+	if err := os.WriteFile(src, []byte("bin"), 0o755); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	for _, name := range []string{"", ".", "..", "../escape", `..\escape`, "a/b"} {
+		if _, err := installApp(src, name); err == nil {
+			t.Errorf("installApp(src, %q) = nil error, want rejection", name)
+		}
+	}
+}
+
+func TestValidateFlags(t *testing.T) {
+	tests := []struct {
+		name       string
+		install    bool
+		clean      bool
+		upgradeAll bool
+		args       []string
+		wantErr    string
+	}{
+		{
+			name:       "clean and upgrade-all are mutually exclusive",
+			clean:      true,
+			upgradeAll: true,
+			wantErr:    "--clean and --upgrade-all are mutually exclusive",
+		},
+		{
+			name:    "install with clean is rejected",
+			install: true,
+			clean:   true,
+			args:    []string{"url"},
+			wantErr: "--install cannot be combined with --clean or --upgrade-all",
+		},
+		{
+			name:       "install with upgrade-all is rejected",
+			install:    true,
+			upgradeAll: true,
+			args:       []string{"url"},
+			wantErr:    "--install cannot be combined with --clean or --upgrade-all",
+		},
+		{
+			name:    "install with trailing args is rejected",
+			install: true,
+			args:    []string{"url", "x"},
+			wantErr: "--install does not forward arguments to the app",
+		},
+		{
+			name:    "install with only a URL is ok",
+			install: true,
+			args:    []string{"url"},
+		},
+		{
+			name:    "install with no args is ok",
+			install: true,
+		},
+		{
+			name: "plain valid combination is ok",
+			args: []string{"url", "--flag"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateFlags(tt.install, tt.clean, tt.upgradeAll, tt.args)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateFlags() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateFlags() error = nil, want %q", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("validateFlags() error = %q, want %q", err, tt.wantErr)
+			}
+		})
 	}
 }

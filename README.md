@@ -67,10 +67,22 @@ gorun --main cmd/mytool github.com/user/repo
 # subpath is built (a subpath with its own go.mod is built as a nested module).
 # The binary is named after the last subpath segment:
 gorun github.com/MegaFair/mf-ai-tools/tree/main/mcp-servers/grafana-logs-downloader
+
+# Build (or reuse) the target's binary and install it to $GOBIN
+# (or $(go env GOPATH)/bin), then exit without running it:
+gorun --install github.com/rakyll/hey
 ```
 
 The first positional argument is the git URL; everything after it is forwarded
 verbatim to the application.
+
+`--install` builds (or reuses the cached) binary and copies it to `$GOBIN` when
+set, otherwise to `$(go env GOPATH)/bin` — the same location `go install` uses —
+then exits without running the app. Trailing arguments are rejected (they would
+only be app arguments), and `--install` cannot be combined with `--clean` or
+`--upgrade-all`. It composes with `--upgrade` (force a re-fetch and rebuild
+before installing) and with `@ref` / `/tree/` URLs, since it reuses the normal
+clone/build flow.
 
 A trailing `@ref` (tag, branch, or commit SHA) pins the checkout: the repo is
 cloned with `git clone --depth 1 --branch <ref>`, and `--upgrade` re-fetches and
@@ -119,8 +131,10 @@ links are not.
 | `--clean`       | Wipe the entire gorun cache, then exit.                           |
 | `--verbose`     | Show the full process output (git clone/pull) without suppression. |
 | `--main <dir>`  | Module-relative path to the `main` package to build (default: the `/tree/` subpath, or auto-detect). |
+| `--install`     | Build (or reuse) the target's binary and install it to `$GOBIN` (or `$(go env GOPATH)/bin`), then exit. |
 
-`--clean` and `--upgrade-all` are mutually exclusive.
+`--clean` and `--upgrade-all` are mutually exclusive. `--install` cannot be
+combined with `--clean` or `--upgrade-all`.
 
 By default git output is suppressed and only shown if the git command fails.
 Pass `--verbose` to stream it live.
@@ -144,6 +158,8 @@ Pass `--verbose` to stream it live.
 4. On subsequent runs the cached binary is reused — no clone or build.
 5. `--upgrade` re-pulls and rebuilds; `--upgrade-all` does this for every cached
    project.
+6. `--install` skips the final run and instead copies the built binary to
+   `$GOBIN` (or `$(go env GOPATH)/bin`).
 
 Signals (SIGINT/SIGTERM) are forwarded to the running app, and its exit code is
 propagated.
